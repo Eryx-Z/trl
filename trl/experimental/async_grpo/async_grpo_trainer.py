@@ -402,6 +402,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
                 "sampling_mask": sample.sampling_mask,
+                "sampling_log_probs": sample.sampling_log_probs,
                 "advantage": sample.advantage,
                 "group_id": sample.group_id,
                 "metrics": sample.metrics,  # per-sample rewards; aggregated by the collator, never sent to the model
@@ -601,6 +602,7 @@ class DataCollatorForRollout(DataCollatorMixin):
             "shift_labels": -100,
             "token_index": -1,
             "sampling_mask": -1,
+            "sampling_log_probs": math.nan,
             "tree_kv_index": -1,
             "tree_cu_seqlens_q": -1,
             "tree_cu_seqlens_k": -1,
@@ -1130,7 +1132,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
             text_model.requires_grad_(True)
             model.get_output_embeddings().requires_grad_(True)
 
-        add_fused_lm_head(model, temperature=self.temperature, outputs=("log_probs", "entropy"))
+        fused_outputs = (
+            ("log_probs", "entropy", "support_log_probs") if args.score_centering else ("log_probs", "entropy")
+        )
+        add_fused_lm_head(model, temperature=self.temperature, outputs=fused_outputs)
 
         # Processing class
         if processing_class is None:
@@ -1383,6 +1388,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     temperature=self.args.temperature,
                     top_p=self.args.top_p,
                     top_k=self.args.top_k,
+                    sampling_log_probs=self.args.score_centering,
                     min_p=self.args.min_p,
                     repetition_penalty=self.args.repetition_penalty,
                     request_timeout=self.args.request_timeout,
@@ -1486,6 +1492,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "token_index",
                 "old_log_probs",
                 "sampling_mask",
+                "sampling_log_probs",
                 "advantages",
                 "segment_id",
                 "global_n_tokens",
@@ -1533,10 +1540,41 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         log_ratio = log_probs - old_log_probs
         coef_1 = torch.exp(log_ratio)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token_loss1 = coef_1 * advantages
-        per_token_loss2 = coef_2 * advantages
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        is_kept = torch.ones_like(coef_1, dtype=torch.bool)
+        if self.args.importance_sampling_min is not None:
+            is_kept &= coef_1 >= self.args.importance_sampling_min
+        if self.args.importance_sampling_max is not None:
+            is_kept &= coef_1 <= self.args.importance_sampling_max
+
+        if self.args.score_centering:
+            support_log_probs = (
+                outputs.support_log_probs[0][token_index]
+                if sampling_mask is not None
+                else log_probs.new_zeros(len(token_index), 0)
+            )
+            sampler_log_probs = inputs["sampling_log_probs"][mask_bool][token_index]
+            with torch.no_grad():
+                head = sampler_log_probs.isfinite()
+                p = support_log_probs.exp() * head
+                q = sampler_log_probs.nan_to_num(nan=-math.inf).exp()
+                rho = (1 - q.sum(-1)).clamp(min=1e-6) / (1 - p.sum(-1)).clamp(min=1e-6)
+                low, high = self.args.importance_sampling_min, self.args.importance_sampling_max
+                if low is None and high is None:
+                    head_mass, tail_scale, weight = q, rho, torch.ones_like(coef_1)
+                else:
+                    low, high = low or 0.0, high or math.inf
+                    head_mass = torch.where((p >= low * q) & (p <= high * q), p, 0.0)
+                    tail_scale = ((rho * low <= 1) & (rho * high >= 1)).float()
+                    weight = torch.where(is_kept, coef_1, 0.0)
+                residual = head_mass - tail_scale.unsqueeze(-1) * p
+            correction = (residual * support_log_probs).sum(-1)
+            per_token_loss = -advantages * (weight * log_probs - correction)
+        else:
+            ratio = torch.clamp(coef_1, max=self.args.delta) if self.args.delta is not None else coef_1
+            coef_2 = torch.clamp(ratio, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            per_token_loss1 = ratio * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2) * is_kept
 
         # DDP/FSDP averages gradients across ranks (world_size).
         # To get correct per-token normalization we scale by 1/tokens_per_rank
@@ -1569,8 +1607,12 @@ class AsyncGRPOTrainer(_BaseTrainer):
             local_low_clip_sum = is_low_clipped.float().sum()
             local_high_clip_sum = is_high_clipped.float().sum()
             local_region_clip_sum = is_region_clipped.float().sum()
+            local_unbounded_sum = ((coef_1 > 1 + self.epsilon_high) & (advantages < 0)).float().sum()
+            local_masked_sum = (~is_kept).float().sum()
+            local_head_mass_sum = q.sum() if self.args.score_centering else torch.zeros_like(local_count)
 
-            # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, low_clip_sum, high_clip_sum, region_clip_sum, count]
+            # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, low_clip_sum, high_clip_sum, region_clip_sum,
+            # unbounded_sum, masked_sum, head_mass_sum, count]
             stats = torch.stack(
                 [
                     local_ratio_sum,
@@ -1579,6 +1621,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     local_low_clip_sum,
                     local_high_clip_sum,
                     local_region_clip_sum,
+                    local_unbounded_sum,
+                    local_masked_sum,
+                    local_head_mass_sum,
                     local_count,
                 ]
             )
@@ -1590,6 +1635,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 global_low_clip_sum,
                 global_high_clip_sum,
                 global_region_clip_sum,
+                global_unbounded_sum,
+                global_masked_sum,
+                global_head_mass_sum,
                 global_count,
             ) = stats.unbind(0)
             self._metrics["train"]["ratio"].append((global_ratio_sum / global_count).item())
@@ -1598,6 +1646,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self._metrics["train"]["clip_ratio/low_mean"].append((global_low_clip_sum / global_count).item())
             self._metrics["train"]["clip_ratio/high_mean"].append((global_high_clip_sum / global_count).item())
             self._metrics["train"]["clip_ratio/region_mean"].append((global_region_clip_sum / global_count).item())
+            self._metrics["train"]["clip_ratio/unbounded_mean"].append((global_unbounded_sum / global_count).item())
+            self._metrics["train"]["importance_sampling/masked_mean"].append((global_masked_sum / global_count).item())
+            if self.args.score_centering:
+                self._metrics["train"]["score_centering/head_mass"].append(
+                    (global_head_mass_sum / global_count).item()
+                )
+            local_ratio_max = coef_1.max() if coef_1.numel() else torch.zeros_like(local_count)
+            self._metrics["train"]["ratio_max"].append(self.accelerator.gather(local_ratio_max).max().item())
 
             num_seq = int(segment_id.max()) + 1  # completions in this rank's row
 

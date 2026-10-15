@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from functools import cache
 from typing import Any
 
@@ -96,6 +97,8 @@ class TreeRow:
                 - `shift_labels` (`N`): next token each position predicts, `-100` where it is not trained.
                 - `sampling_mask` (`N`, `C`): candidate set the sampler drew that next token from, padded with `-1`;
                   `C` is `0` without top-k/top-p truncation.
+                - `sampling_log_probs` (`N`, `C`): the sampler's log-prob of each candidate, `NaN` where unknown or
+                  padded; `C` is `0` unless they were requested.
                 - `tree_kv_index` (`K`): packed position of every K/V row [`tree_attention`] gathers, the
                   root-to-segment paths of all segments laid end to end.
                 - `tree_cu_seqlens_q` (`S + 1`), `tree_cu_seqlens_k` (`S + 1`): segment boundaries in the row, path
@@ -129,6 +132,7 @@ class TreeRow:
 
         shift_labels = [-100] * len(input_ids)
         sampling_mask = [[] for _ in input_ids]
+        sampling_log_probs = [[] for _ in input_ids]
         token_index, old_log_probs, advantages, segment_id = [], [], [], []
         for i, (sample, nodes) in enumerate(zip(self.samples, self.sample_nodes, strict=True)):
             ids, mask, logps = (sample[key].tolist() for key in ("input_ids", "completion_mask", "old_log_probs"))
@@ -136,11 +140,13 @@ class TreeRow:
                 if mask[p]:
                     shift_labels[packed[nodes[p - 1]]] = ids[p]
                     sampling_mask[packed[nodes[p - 1]]] = sample["sampling_mask"][p]
+                    sampling_log_probs[packed[nodes[p - 1]]] = sample["sampling_log_probs"][p]
                     token_index.append(packed[nodes[p - 1]])
                     old_log_probs.append(logps[p])
                     advantages.append(sample["advantage"])
                     segment_id.append(i)
         width = max(map(len, sampling_mask))
+        log_probs_width = max(map(len, sampling_log_probs))
         return {
             "input_ids": torch.tensor(input_ids),
             "position_ids": torch.tensor(position_ids),
@@ -148,6 +154,10 @@ class TreeRow:
             "sampling_mask": torch.tensor(
                 [candidates + [-1] * (width - len(candidates)) for candidates in sampling_mask], dtype=torch.long
             ).view(len(input_ids), width),
+            "sampling_log_probs": torch.tensor(
+                [values + [math.nan] * (log_probs_width - len(values)) for values in sampling_log_probs],
+                dtype=torch.float32,
+            ).view(len(input_ids), log_probs_width),
             "tree_kv_index": torch.tensor(kv_index, dtype=torch.long),
             "tree_cu_seqlens_q": torch.tensor(offsets, dtype=torch.int32),
             "tree_cu_seqlens_k": torch.tensor(cu_seqlens_k, dtype=torch.int32),

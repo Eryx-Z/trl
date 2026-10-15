@@ -107,6 +107,23 @@ class AsyncGRPOConfig(_BaseConfig):
         epsilon_high (`float`, *optional*):
             Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound
             specified in argument `epsilon`. Paper [DAPO](https://huggingface.co/papers/2503.14476) recommends `0.28`.
+        delta (`float`, *optional*):
+            Enables the upper clipping bound in two-sided GRPO loss when set to a float. If `None` (default), standard
+            GRPO clipping is used. Recommended to be greater than `1 + ε` when enabled. This method is introduced in
+            the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291).
+        importance_sampling_min (`float`, *optional*):
+            Lower bound of the importance ratio between the trained policy and the vLLM sampler. Tokens whose ratio is
+            below it are dropped from the loss (masked importance sampling). If `None` (default), there is no lower
+            bound.
+        importance_sampling_max (`float`, *optional*):
+            Upper bound of the same ratio: tokens above it are dropped from the loss. If `None` (default), there is no
+            upper bound.
+        score_centering (`bool`, *optional*, defaults to `False`):
+            Whether to replace the clipped PPO objective with score centering: a policy gradient weighted by the
+            importance ratio (masked by `importance_sampling_min` and `importance_sampling_max` when set), minus its
+            expectation under the sampler at every position, so a constant advantage does not move the policy toward
+            the sampler. The expectation uses the sampler's log-probs of the candidates of each token, so it needs
+            `top_k > 0` and the server flags described under `top_p`.
         token_budget (`int`, *optional*):
             Maximum number of tokens forwarded in a single row (one DP rank's forward) for dynamic token-budgeted
             micro-batching. When `> 0`, a `TokenBudgetBatcher` forms attention-cost-balanced micro-batches whose rows
@@ -334,6 +351,36 @@ class AsyncGRPOConfig(_BaseConfig):
             "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."
         },
     )
+    delta: float | None = field(
+        default=None,
+        metadata={
+            "help": "Enables the upper clipping bound in two-sided GRPO loss when set to a float. If `None` "
+            "(default), standard GRPO clipping is used. Recommended to be greater than `1 + ε` when enabled. This "
+            "method is introduced in the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291)."
+        },
+    )
+    importance_sampling_min: float | None = field(
+        default=None,
+        metadata={
+            "help": "Lower bound of the importance ratio between the trained policy and the vLLM sampler. Tokens "
+            "whose ratio is below it are dropped from the loss (masked importance sampling). If `None`, there is no "
+            "lower bound."
+        },
+    )
+    importance_sampling_max: float | None = field(
+        default=None,
+        metadata={
+            "help": "Upper bound of the importance ratio: tokens above it are dropped from the loss. If `None`, "
+            "there is no upper bound."
+        },
+    )
+    score_centering: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to replace the clipped PPO objective with score centering: an importance-weighted policy "
+            "gradient minus its expectation under the sampler. Needs `top_k > 0`."
+        },
+    )
     token_budget: int | None = field(
         default=None,
         metadata={
@@ -397,6 +444,12 @@ class AsyncGRPOConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.score_centering and self.top_k == 0:
+            raise ValueError(
+                "`score_centering=True` needs `top_k > 0`: the centering uses the sampler's log-probs over the candidate "
+                "set vLLM returns for each sampled token."
+            )
 
         if self.top_p < 1.0 and self.top_k == 0:
             raise ValueError(

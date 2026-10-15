@@ -71,6 +71,18 @@ def _support_mask(support_ids: torch.Tensor, vocab_start: int, vocab_end: int) -
     return support_mask
 
 
+def _gather_support(tile: torch.Tensor, support_ids: torch.Tensor, vocab_start: int) -> tuple[torch.Tensor, ...]:
+    """
+    Raw logits of one vocabulary tile at the support ids: `[n, K]` values, their clamped column in the tile and whether
+    the id falls in the tile at all.
+    """
+    width = tile.shape[1]
+    local = support_ids - vocab_start
+    in_tile = (local >= 0) & (local < width)
+    local = local.clamp(0, width - 1)
+    return tile.gather(1, local).float(), local, in_tile
+
+
 @_jit
 def _transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP: tl.constexpr):
     # Before torch 2.15, torch.compile passes Python float arguments as fp64; keep the math in fp32
@@ -348,7 +360,8 @@ class ChunkedLogProbFunction(torch.autograd.Function):
     With `support_ids`, a `[N, K]` tensor of token ids padded with `-1`, the log-probabilities and their gradient are
     normalized over each row's support, the set of tokens the sampler could draw, instead of the whole vocabulary,
     matching a sampler that drew the target from a top-k/top-p truncated distribution. The entropy stays that of the
-    whole vocabulary.
+    whole vocabulary. With `"support_log_probs"` in `outputs` and `support_ids` given, the sixth output is the `[N, K]`
+    log-probability of every support token under that normalization (`0` at padding), differentiable like the first.
     """
 
     @staticmethod
@@ -364,7 +377,7 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         logit_scale: float = 1.0,
         outputs: tuple[str, ...] = OPTIONAL_OUTPUTS,
         support_ids: torch.Tensor | None = None,  # [N, K]
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, ...]:
         # entropy is often computed for logging only (no grad required); without this, autograd would
         # materialize its incoming gradient as zeros and backward would waste compute on a no-op term
         ctx.set_materialize_grads(False)
@@ -391,6 +404,10 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         z_sum = torch.zeros((N,), device=device, dtype=torch.float32)
         max_before_target = torch.full((N,), float("-inf"), device=device, dtype=torch.float32)
         target_logit = torch.zeros((N,), device=device, dtype=torch.float32)
+        with_support_log_probs = "support_log_probs" in outputs and support_ids is not None
+        support_logit = (
+            torch.zeros(support_ids.shape, device=device, dtype=torch.float32) if with_support_log_probs else None
+        )
         mm_buf = torch.empty((min(N, TOKEN_CHUNK_SIZE), chunk_size), device=device, dtype=compute_dtype)
 
         for token_start in range(0, N, TOKEN_CHUNK_SIZE):
@@ -408,6 +425,13 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                     if support_ids is not None
                     else running_max
                 )
+                if with_support_log_probs:
+                    z, _, in_tile = _gather_support(tile, support_ids[token_start:token_end], start)
+                    z = _torch_transform(
+                        z, logit_scale, final_logit_softcapping, 1 / temperature, final_logit_softcapping is not None
+                    )
+                    chunk = support_logit[token_start:token_end]
+                    chunk.copy_(torch.where(in_tile, z, chunk))
                 fold = _forward_kernel[(n,)] if _use_triton(device) else _forward_tile
                 fold(
                     tile,
@@ -437,6 +461,11 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         log_sum_sq_probs = torch.log(sq_sum_exp) - 2 * torch.log(sum_exp) if "log_sum_sq_probs" in outputs else None
         mean_logits = z_sum / vocab if "mean_logits" in outputs else None
         is_top1 = (target_logit >= running_max) & (target_logit > max_before_target) if "is_top1" in outputs else None
+        support_log_probs = (
+            (support_logit - support_log_z.unsqueeze(-1)).masked_fill(support_ids < 0, 0.0)
+            if with_support_log_probs
+            else None
+        )
 
         # Without entropy there is no entropy gradient, so `log_z` only fills its slot
         ctx.save_for_backward(
@@ -445,11 +474,12 @@ class ChunkedLogProbFunction(torch.autograd.Function):
         ctx.compute_dtype = compute_dtype
         ctx.chunk_size = chunk_size
         ctx.kernel_args = kernel_args
+        ctx.logit_scale, ctx.temperature, ctx.softcap = logit_scale, temperature, final_logit_softcapping
         ctx.mark_non_differentiable(*(x for x in (log_sum_sq_probs, mean_logits, is_top1) if x is not None))
-        return logprobs, entropy, log_sum_sq_probs, mean_logits, is_top1
+        return logprobs, entropy, log_sum_sq_probs, mean_logits, is_top1, support_log_probs
 
     @staticmethod
-    def backward(ctx, grad_logprobs: torch.Tensor | None, grad_entropy: torch.Tensor | None, *_):  # type: ignore
+    def backward(ctx, grad_logprobs, grad_entropy, _grad_sq, _grad_mean, _grad_top1, grad_support):  # type: ignore
         # `trl.trainer.utils` imports this module, so import from it at call time
         from ..trainer.utils import maybe_gather_lm_head_ctx
 
@@ -470,6 +500,12 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             grad_bias = torch.zeros(bias.shape, device=bias.device, dtype=torch.float32) if needs_bias_grad else None
             mm_buf = torch.empty((min(N, TOKEN_CHUNK_SIZE), chunk_size), device=hidden.device, dtype=compute_dtype)
             grad_logprobs = grad_logprobs.float().contiguous() if grad_logprobs is not None else None
+            if grad_support is not None:
+                grad_support = grad_support.float().masked_fill(support_ids < 0, 0.0)
+                grad_support_sum = grad_support.sum(-1)
+                grad_logprobs = grad_support_sum if grad_logprobs is None else grad_logprobs + grad_support_sum
+                is_target = support_ids == targets.unsqueeze(-1)
+                grad_support = grad_support - grad_support_sum.unsqueeze(-1) * is_target
             grad_entropy = grad_entropy.float().contiguous() if grad_entropy is not None else None
 
             for token_start in range(0, N, TOKEN_CHUNK_SIZE):
@@ -488,6 +524,13 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         if support_ids is not None
                         else log_z
                     )
+                    if grad_support is not None:
+                        y, local, in_tile = _gather_support(tile, support_ids[token_start:token_end], start)
+                        y = y * ctx.logit_scale
+                        chain = torch.full_like(y, ctx.logit_scale / ctx.temperature)
+                        if ctx.softcap is not None:
+                            chain = chain * (1 - torch.tanh(y / ctx.softcap) ** 2)
+                        sparse_grad = grad_support[token_start:token_end] * chain * in_tile
                     fold = (
                         _backward_kernel[(n, triton.cdiv(end - start, _BLOCK_SIZE))]
                         if _use_triton(hidden.device)
@@ -511,6 +554,8 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         BLOCK_SIZE=_BLOCK_SIZE,
                         **ctx.kernel_args,
                     )
+                    if grad_support is not None:
+                        tile.scatter_add_(1, local, sparse_grad.to(tile.dtype))
                     if grad_hidden is not None:
                         _addmm_fp32(grad_hidden[token_start:token_end], tile, w_chunk)
                     if grad_weight is not None:

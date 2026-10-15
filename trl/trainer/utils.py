@@ -1528,6 +1528,9 @@ class FusedCausalLMOutput(ModelOutput):
             Mean of the temperature-scaled next-token logits over the vocabulary, without gradient.
         is_top1 (`torch.Tensor`, same shape as `log_probs`):
             Whether the label is the most likely next token.
+        support_log_probs (`torch.Tensor` of shape `(*log_probs.shape, K)`):
+            Log-probability of every token of the `support_ids` given to the forward, normalized like `log_probs`, `0`
+            at padding.
         label_mask (`torch.Tensor`, same shape as `log_probs`):
             Whether the label is not `-100`. Prompt-learning PEFT pads the labels, so this can count one more token per
             sequence than the caller's labels.
@@ -1541,6 +1544,7 @@ class FusedCausalLMOutput(ModelOutput):
     log_sum_sq_probs: torch.Tensor | None = None
     mean_logits: torch.Tensor | None = None
     is_top1: torch.Tensor | None = None
+    support_log_probs: torch.Tensor | None = None
     label_mask: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
 
@@ -1573,8 +1577,9 @@ def add_fused_lm_head(
             Whether to run the LM head projection in float32, outside autocast.
         outputs (`tuple[str, ...]`, *optional*, defaults to `("log_probs",)`):
             Per-token fields of [`FusedCausalLMOutput`] the kernel computes, among `"log_probs"`, `"entropy"`,
-            `"log_sum_sq_probs"`, `"mean_logits"` and `"is_top1"`. The others are `None`. `log_probs` (and so `loss`)
-            is always computed; each extra field costs a little on every call.
+            `"log_sum_sq_probs"`, `"mean_logits"`, `"is_top1"` and `"support_log_probs"` (only with `support_ids`). The
+            others are `None`. `log_probs` (and so `loss`) is always computed; each extra field costs a little on every
+            call.
     """
     original_forward = model.forward
     text_config = model.config.get_text_config()
@@ -1674,10 +1679,22 @@ def add_fused_lm_head(
         if compact:
             # `masked_scatter` keeps the output connected to the model even when no label is valid. This lets an
             # all-masked microbatch contribute a differentiable zero instead of failing in `backward()`.
-            per_token = (None if x is None else x.new_zeros(mask.shape).masked_scatter(mask, x) for x in per_token)
+            per_token = (
+                None
+                if x is None
+                else x.new_zeros(mask.shape + x.shape[1:]).masked_scatter(
+                    mask.view(mask.shape + (1,) * (x.dim() - 1)), x
+                )
+                for x in per_token
+            )
         else:
-            per_token = (None if x is None else x.view(mask.shape).masked_fill(~mask, 0) for x in per_token)
-        log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1 = per_token
+            per_token = (
+                None
+                if x is None
+                else x.view(mask.shape + x.shape[1:]).masked_fill(~mask.view(mask.shape + (1,) * (x.dim() - 1)), 0)
+                for x in per_token
+            )
+        log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1, support_log_probs = per_token
         loss = -log_probs.sum() / (mask.sum().clamp(min=1) if num_items_in_batch is None else num_items_in_batch)
 
         aux_loss = None
@@ -1710,6 +1727,7 @@ def add_fused_lm_head(
             log_sum_sq_probs=log_sum_sq_probs,
             mean_logits=mean_logits,
             is_top1=is_top1,
+            support_log_probs=support_log_probs,
             label_mask=mask,
             aux_loss=aux_loss,
         )
